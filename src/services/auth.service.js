@@ -39,23 +39,58 @@ export default class AuthService {
   // tag::register[]
   async register(email, plainPassword, name) {
     const encrypted = await hash(plainPassword, parseInt(SALT_ROUNDS))
-
-    // tag::constraintError[]
-    // TODO: Handle Unique constraints in the database
-    if (email !== 'graphacademy@neo4j.com') {
-      throw new ValidationError(`An account already exists with the email address ${email}`, {
-        email: 'Email address taken'
-      })
+  
+    // Open a new session
+    const session = this.driver.session()
+  
+    try {
+      // Create the User node in a write transaction
+      const res = await session.executeWrite(
+        tx => tx.run(
+          `
+            CREATE (u:User {
+              userId: randomUuid(),
+              email: $email,
+              password: $encrypted,
+              name: $name
+            })
+            RETURN u
+          `,
+          { email, encrypted, name }
+        )
+      )
+  
+      // Extract the user from the result
+      const [ first ] = res.records
+      const node = first.get('u')
+  
+      const { password, ...safeProperties } = node.properties
+  
+      // Close the session
+      await session.close()
+  
+      return {
+        ...safeProperties,
+        token: jwt.sign(this.userToClaims(safeProperties), JWT_SECRET),
+      }
     }
-    // end::constraintError[]
-
-    // TODO: Save user
-
-    const { password, ...safeProperties } = user
-
-    return {
-      ...safeProperties,
-      token: jwt.sign(this.userToClaims(safeProperties), JWT_SECRET),
+    catch (e) {
+      // Handle unique constraints in the database
+      if (e.code === 'Neo.ClientError.Schema.ConstraintValidationFailed') {
+        throw new ValidationError(
+          `An account already exists with the email address ${email}`,
+          {
+            email: 'Email address already taken'
+          }
+        )
+      }
+  
+      // Non-neo4j error
+      throw e
+    }
+    finally {
+      // Close the session
+      await session.close()
     }
   }
   // end::register[]
@@ -82,17 +117,42 @@ export default class AuthService {
    */
   // tag::authenticate[]
   async authenticate(email, unencryptedPassword) {
-    // TODO: Authenticate the user from the database
-    if (email === 'graphacademy@neo4j.com' && unencryptedPassword === 'letmein') {
-      const { password, ...claims } = user.properties
-
-      return {
-        ...claims,
-        token: jwt.sign(claims, JWT_SECRET)
-      }
+    // Open a new session
+    const session = this.driver.session()
+  
+    // Find the user node within a Read Transaction
+    const res = await session.executeRead(
+      tx => tx.run(
+        'MATCH (u:User {email: $email}) RETURN u',
+        { email }
+      )
+    )
+  
+    // Close the session
+    await session.close()
+  
+    // Verify the user exists
+    if ( res.records.length === 0 ) {
+      return false
     }
-
-    return false
+  
+    // Compare Passwords
+    const user = res.records[0].get('u')
+    const encryptedPassword = user.properties.password
+  
+    const correct = await compare(unencryptedPassword, encryptedPassword)
+  
+    if ( correct === false ) {
+      return false
+    }
+  
+    // Return User Details
+    const { password, ...safeProperties } = user.properties
+  
+    return {
+      ...safeProperties,
+      token: jwt.sign(this.userToClaims(safeProperties), JWT_SECRET),
+    }
   }
   // end::authenticate[]
 
